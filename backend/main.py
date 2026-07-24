@@ -24,8 +24,14 @@ from sqlmodel import Session, SQLModel, create_engine, select
 from starlette.exceptions import HTTPException
 
 import models  # noqa: F401  # SQLModel 메타데이터에 테이블을 등록한다.
-from config import get_cors_origins
+from config import get_cors_origins, get_sync_on_startup, get_sync_secret
 from db_migrate import ensure_performance_shcate_column
+from sync_service import (
+    count_performances,
+    get_sync_state,
+    is_sync_running,
+    start_sync_background,
+)
 from genre_codes import SHCATE_CODES
 from models import (
     BoxofficeRanking,
@@ -103,12 +109,28 @@ def enable_sqlite_wal(dbapi_connection, connection_record):
     cursor.close()
 
 
+def _should_start_startup_sync() -> bool:
+    """기동 시 공공 API 동기화 여부를 SYNC_ON_STARTUP 정책으로 결정한다."""
+    policy = get_sync_on_startup()
+    if policy == "never":
+        return False
+    if policy == "always":
+        return True
+    return count_performances(engine) == 0
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 서버가 켜질 때, 정의된 모델들의 테이블을 자동으로 만든다.
     # (아직 모델이 없으면 아무것도 안 만들어짐 → 모델을 추가하면 그때 테이블 생성)
     SQLModel.metadata.create_all(engine)
     ensure_performance_shcate_column(engine)
+    if _should_start_startup_sync():
+        started = start_sync_background(trigger="startup")
+        if started:
+            logger.info("기동 시 데이터 동기화를 백그라운드로 시작했습니다.")
+        else:
+            logger.info("기동 시 동기화를 건너뜁니다(이미 실행 중).")
     yield
 
 
@@ -185,7 +207,72 @@ def health():
             .limit(1)
         ).first()
 
-    return {"status": "ok", "last_ingested_at": last_ingested_at}
+    sync = get_sync_state()
+    return {
+        "status": "ok",
+        "last_ingested_at": last_ingested_at,
+        "sync_status": sync["status"],
+    }
+
+
+def _require_sync_secret(request: Request) -> None:
+    """X-Sync-Secret 헤더가 설정된 SYNC_SECRET과 일치하는지 검사한다."""
+    configured = get_sync_secret()
+    if not configured:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "SYNC_DISABLED",
+                "message": "SYNC_SECRET이 설정되지 않아 동기화 API를 사용할 수 없습니다.",
+            },
+        )
+    provided = request.headers.get("X-Sync-Secret", "").strip()
+    if not provided or provided != configured:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "UNAUTHORIZED",
+                "message": "동기화 시크릿이 올바르지 않습니다.",
+            },
+        )
+
+
+@app.get("/api/sync/status")
+def sync_status(request: Request):
+    """동기화 진행 상태를 반환한다. SYNC_SECRET 필요."""
+    _require_sync_secret(request)
+    return get_sync_state()
+
+
+@app.post("/api/sync")
+async def trigger_sync(request: Request):
+    """
+    KOPIS·행안부 API에서 데이터를 받아 SQLite에 동기화한다.
+    배포 직후나 수동 갱신 시 사용하며, 백그라운드로 실행된다.
+    """
+    _require_sync_secret(request)
+    if is_sync_running():
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SYNC_IN_PROGRESS",
+                "message": "동기화가 이미 진행 중입니다.",
+            },
+        )
+    started = start_sync_background(trigger="api")
+    if not started:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "SYNC_IN_PROGRESS",
+                "message": "동기화가 이미 진행 중입니다.",
+            },
+        )
+    return {
+        "code": "SYNC_STARTED",
+        "message": "동기화를 시작했습니다. /api/sync/status 로 진행 상태를 확인하세요.",
+        "state": get_sync_state(),
+    }
 
 
 @app.get("/api/regions", response_model=ListResponse[RegionResponse])

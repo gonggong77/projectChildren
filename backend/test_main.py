@@ -43,7 +43,7 @@ class HealthApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(
             response.json(),
-            {"status": "ok", "last_ingested_at": None},
+            {"status": "ok", "last_ingested_at": None, "sync_status": "idle"},
         )
 
     def test_returns_latest_finished_ingestion_time(self):
@@ -70,6 +70,7 @@ class HealthApiTests(unittest.TestCase):
             {
                 "status": "ok",
                 "last_ingested_at": "2026-07-24T02:00:00+00:00",
+                "sync_status": "idle",
             },
         )
 
@@ -774,6 +775,87 @@ class CommonResponseTests(unittest.TestCase):
                 "items": ["PF1"],
             },
         )
+
+
+class SyncApiTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        db_path = Path(self.temp_dir.name) / "test.db"
+        self.engine = create_engine(
+            f"sqlite:///{db_path.as_posix()}",
+            connect_args={"check_same_thread": False},
+        )
+        SQLModel.metadata.create_all(self.engine)
+        self.engine_patch = patch.object(main, "engine", self.engine)
+        self.engine_patch.start()
+        self.client = TestClient(main.app)
+
+    def tearDown(self):
+        self.engine_patch.stop()
+        self.engine.dispose()
+        self.temp_dir.cleanup()
+
+    def test_sync_disabled_without_secret(self):
+        with patch("main.get_sync_secret", return_value=None):
+            response = self.client.post("/api/sync")
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.json()["code"], "SYNC_DISABLED")
+
+    def test_sync_rejects_wrong_secret(self):
+        with patch("main.get_sync_secret", return_value="correct-secret"):
+            response = self.client.post(
+                "/api/sync",
+                headers={"X-Sync-Secret": "wrong"},
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertEqual(response.json()["code"], "UNAUTHORIZED")
+
+    def test_sync_starts_in_background(self):
+        with (
+            patch("main.get_sync_secret", return_value="correct-secret"),
+            patch("main.is_sync_running", return_value=False),
+            patch("main.start_sync_background", return_value=True) as start_sync,
+            patch(
+                "main.get_sync_state",
+                return_value={
+                    "status": "running",
+                    "started_at": "2026-07-24T03:00:00+00:00",
+                    "finished_at": None,
+                    "trigger": "api",
+                    "error": None,
+                    "result": None,
+                },
+            ),
+        ):
+            response = self.client.post(
+                "/api/sync",
+                headers={"X-Sync-Secret": "correct-secret"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["code"], "SYNC_STARTED")
+        start_sync.assert_called_once_with(trigger="api")
+
+    def test_sync_conflict_when_already_running(self):
+        with (
+            patch("main.get_sync_secret", return_value="correct-secret"),
+            patch("main.is_sync_running", return_value=True),
+        ):
+            response = self.client.post(
+                "/api/sync",
+                headers={"X-Sync-Secret": "correct-secret"},
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["code"], "SYNC_IN_PROGRESS")
+
+    def test_sync_status_requires_secret(self):
+        with patch("main.get_sync_secret", return_value="correct-secret"):
+            response = self.client.get("/api/sync/status")
+
+        self.assertEqual(response.status_code, 401)
 
 
 if __name__ == "__main__":
